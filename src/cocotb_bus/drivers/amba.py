@@ -597,13 +597,160 @@ class AXI4Slave(BusDriver):
         self.read_address_busy = Lock("%s_rabusy" % name)
         self.write_data_busy = Lock("%s_wbusy" % name)
 
-        cocotb.fork(self._read_data())
-        cocotb.fork(self._write_data())
+        # cocotb.fork(self._read_data())
+        # cocotb.fork(self._write_data())
+        self._inflight_raddr = []	
+        self._inflight_rid = []	
+        self._inflight_rlen = []	
+        self._inflight_waddr = []	
+        self._inflight_wid = []	
+        self._inflight_wlen = []	
+        self._inflight_wdata = []	
+        cocotb.start_soon(self._update_r_queue())	
+        cocotb.start_soon(self._update_w_queue())	
+        cocotb.start_soon(self._seq_read_write())	
+
 
     def _size_to_bytes_in_beat(self, AxSIZE):
         if AxSIZE < 7:
             return 2 ** AxSIZE
         return None
+
+    async def _update_r_queue(self):
+        clock_re = RisingEdge(self.clock)
+        await ReadOnly()
+        while True:
+            if self.bus.ARVALID.value and self.bus.ARID.value not in self._inflight_rid:
+                print(f"arvalid is {self.bus.ARVALID.value} and ID list is now {self._inflight_rid}")
+                self._inflight_raddr.append(self.bus.ARADDR.value)
+                self._inflight_rid.append(self.bus.ARID.value)
+                self._inflight_rlen.append(self.bus.ARLEN.value)
+            await clock_re
+
+    async def _update_w_queue(self):
+        clock_re = RisingEdge(self.clock)
+        self.bus.WREADY.value = 0
+        await ReadOnly()
+        if self.bus.AWVALID.value and self.bus.AWID.value not in self._inflight_wid:
+            self._inflight_waddr.append(self.bus.AWADDR.value)
+            self._inflight_wlen.append(self.bus.AWLEN.value)
+            self.bus.WREADY.value = 1
+            await clock_re
+            while True:
+                if self.bus.WVALID.value:
+                    self._inflight_wdata.append(self.bus.WDATA.value)
+                    self._inflight_wid.append(self.bus.AWID.value)
+                    break
+
+    async def _seq_read_write(self):	
+        clock_re = RisingEdge(self.clock)	
+        while True:	
+            if self._inflight_rid:	
+                print(f"starting read for rid-{self._inflight_rid[0]}, raddr-{self._inflight_raddr[0]}, rlen-{self._inflight_rlen[0]}")    	
+                await self._single_read()	
+                print(f"deleting rid-{self._inflight_rid[0]} from rid list-{self._inflight_rid}") 	
+                del self._inflight_rid[0]	
+                del self._inflight_raddr[0]	
+                del self._inflight_rlen[0]	
+                print(f"deleted rid list is now {self._inflight_rid}")	
+            elif self._inflight_wid:    	
+                await self._single_read()	
+                del self._inflight_wid[0]	
+                del self._inflight_waddr[0]	
+                del self._inflight_wlen[0]	
+                del self._inflight_wdata[0]	
+            await clock_re
+
+    async def _single_read(self):
+        clock_re = RisingEdge(self.clock)
+        _araddr = self._inflight_raddr[0]
+        _arlen = self._inflight_rlen[0]
+        _arid = self._inflight_rid[0]
+
+        burst_length = _arlen + 1
+        bytes_in_beat = 8
+
+        word = BinaryValue(n_bits=bytes_in_beat*8, bigEndian=self.big_endian)
+
+        if __debug__:
+            self.log.debug(
+                "ARADDR  %d\n" % _araddr +
+                "ARLEN   %d\n" % _arlen +
+                "ARID %d\n" % _arid +
+                "BURST_LENGTH %d\n" % burst_length +
+                "Bytes in beat %d\n" % bytes_in_beat)
+
+        burst_count = burst_length
+        while True:
+                self.bus.RVALID.value = 1
+                self.bus.RID.value = _arid 
+                if self.bus.RREADY.value:
+                    _burst_diff = burst_length - burst_count
+                    _st = _araddr + (_burst_diff * bytes_in_beat)
+                    _end = _araddr + ((_burst_diff + 1) * bytes_in_beat)
+                    word.buff = self._memory[_st:_end]
+                    self.bus.RDATA.value = word
+                    if burst_count == 1:
+                        self.bus.RLAST.value = 1
+                        print(f"read with rid {_arid} is done")
+                await clock_re
+                burst_count -= 1
+                self.bus.RLAST.value = 0
+                if burst_count == 0:
+                    self.bus.RVALID.value = 0
+                    break
+
+    async def _single_write(self):
+        clock_re = RisingEdge(self.clock)
+
+        while True:
+            while True:
+                self.bus.WREADY.value = 0
+                if self.bus.AWVALID.value:
+                    self.bus.WREADY.value = 1
+                    break
+                await clock_re
+
+            await ReadOnly()
+            _awaddr = int(self.bus.AWADDR.value)
+            _awlen = int(self.bus.AWLEN.value)
+            _awsize = int(self.bus.AWSIZE.value)
+            _awburst = int(self.bus.AWBURST.value)
+            _awprot = int(self.bus.AWPROT.value)
+            _awid = int(self.bus.AWID.value)
+
+
+            burst_length = _awlen + 1
+            bytes_in_beat = self._size_to_bytes_in_beat(_awsize)
+
+            if __debug__:
+                self.log.debug(
+                    "AWADDR  %d\n" % _awaddr +
+                    "AWLEN   %d\n" % _awlen +
+                    "AWSIZE  %d\n" % _awsize +
+                    "AWBURST %d\n" % _awburst +
+                    "AWPROT %d\n" % _awprot +
+                    "AWID %d\n" % _awid +
+                    "BURST_LENGTH %d\n" % burst_length +
+                    "Bytes in beat %d\n" % bytes_in_beat)
+
+            burst_count = burst_length
+
+            await clock_re
+
+            while True:
+                if self.bus.WVALID.value:
+                    self.bus.BID.value = _awid 
+                    word = self.bus.WDATA.value
+                    word.big_endian = self.big_endian
+                    _burst_diff = burst_length - burst_count
+                    _st = _awaddr + (_burst_diff * bytes_in_beat)  # start
+                    _end = _awaddr + ((_burst_diff + 1) * bytes_in_beat)  # end
+                    self._memory[_st:_end] = array.array('B', word.buff)
+                    burst_count -= 1
+                    if burst_count == 0:
+                        break
+                await clock_re
 
     async def _write_data(self):
         clock_re = RisingEdge(self.clock)
@@ -617,11 +764,12 @@ class AXI4Slave(BusDriver):
                 await clock_re
 
             await ReadOnly()
-            _awaddr = int(self.bus.AWADDR)
-            _awlen = int(self.bus.AWLEN)
-            _awsize = int(self.bus.AWSIZE)
-            _awburst = int(self.bus.AWBURST)
-            _awprot = int(self.bus.AWPROT)
+            _awaddr = int(self.bus.AWADDR.value)
+            _awlen = int(self.bus.AWLEN.value)
+            _awsize = int(self.bus.AWSIZE.value)
+            _awburst = int(self.bus.AWBURST.value)
+            _awprot = int(self.bus.AWPROT.value)
+            _awid = int(self.bus.AWID.value)
 
             burst_length = _awlen + 1
             bytes_in_beat = self._size_to_bytes_in_beat(_awsize)
@@ -633,6 +781,7 @@ class AXI4Slave(BusDriver):
                     "AWSIZE  %d\n" % _awsize +
                     "AWBURST %d\n" % _awburst +
                     "AWPROT %d\n" % _awprot +
+                    "AWID %d\n" % _awid +
                     "BURST_LENGTH %d\n" % burst_length +
                     "Bytes in beat %d\n" % bytes_in_beat)
 
@@ -642,6 +791,7 @@ class AXI4Slave(BusDriver):
 
             while True:
                 if self.bus.WVALID.value:
+                    self.bus.BID.value = _awid 
                     word = self.bus.WDATA.value
                     word.big_endian = self.big_endian
                     _burst_diff = burst_length - burst_count
@@ -664,11 +814,12 @@ class AXI4Slave(BusDriver):
                 await clock_re
 
             await ReadOnly()
-            _araddr = int(self.bus.ARADDR)
-            _arlen = int(self.bus.ARLEN)
-            _arsize = int(self.bus.ARSIZE)
-            _arburst = int(self.bus.ARBURST)
-            _arprot = int(self.bus.ARPROT)
+            _araddr = int(self.bus.ARADDR.value)
+            _arlen = int(self.bus.ARLEN.value)
+            _arsize = int(self.bus.ARSIZE.value)
+            _arburst = int(self.bus.ARBURST.value)
+            _arprot = int(self.bus.ARPROT.value)
+            _arid = int(self.bus.ARID.value)
 
             burst_length = _arlen + 1
             bytes_in_beat = self._size_to_bytes_in_beat(_arsize)
@@ -682,6 +833,7 @@ class AXI4Slave(BusDriver):
                     "ARSIZE  %d\n" % _arsize +
                     "ARBURST %d\n" % _arburst +
                     "ARPROT %d\n" % _arprot +
+                    "ARID %d\n" % _arid +
                     "BURST_LENGTH %d\n" % burst_length +
                     "Bytes in beat %d\n" % bytes_in_beat)
 
@@ -691,6 +843,7 @@ class AXI4Slave(BusDriver):
 
             while True:
                 self.bus.RVALID.value = 1
+                self.bus.RID.value = _arid
                 if self.bus.RREADY.value:
                     _burst_diff = burst_length - burst_count
                     _st = _araddr + (_burst_diff * bytes_in_beat)
@@ -703,4 +856,5 @@ class AXI4Slave(BusDriver):
                 burst_count -= 1
                 self.bus.RLAST.value = 0
                 if burst_count == 0:
+                    self.bus.RVALID.value = 0
                     break
