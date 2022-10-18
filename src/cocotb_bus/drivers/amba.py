@@ -668,7 +668,7 @@ class AXI4Slave(BusDriver):
         _arid = self._inflight_rid[0]
 
         burst_length = _arlen + 1
-        bytes_in_beat = 8
+        bytes_in_beat = 64
 
         word = BinaryValue(n_bits=bytes_in_beat*8, bigEndian=self.big_endian)
 
